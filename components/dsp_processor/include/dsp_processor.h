@@ -11,7 +11,7 @@ enum dspFlows {
 
 size_t write_ringbuf(const uint8_t *data, size_t size);
 
-void dsp_i2s_task_init(uint32_t sample_rate, bool slave);
+xTaskHandle dsp_i2s_task_init(uint32_t sample_rate, bool slave);
 
 void dsp_i2s_task_deinit(void);
 
@@ -27,6 +27,14 @@ enum filtertypes {
   LOWSHELF,
   HIGHSHELF
 };
+
+// Audio packet containg the samples and time info
+typedef struct audio_pkt_element {
+  uint32_t timestamp_sec;
+  uint32_t timestamp_usec;
+  uint32_t samplebuf_sz;
+  int16_t *samplebuf;
+} audio_pkt_element_t;
 
 // Process node
 typedef struct ptype {
@@ -44,6 +52,17 @@ typedef struct pnode {
   ptype_t process;
   struct pnode *next;
 } pnode_t;
+
+typedef enum snap_ctrl_type {
+  VOLUME,
+  MUTE,
+  LATENCY
+} snap_ctrl_type_t;
+
+typedef struct snap_ctrl_element {
+  snap_ctrl_type_t type;
+  int32_t value;
+} snap_ctrl_element_t;
 
 void dsp_setup_flow(double freq, uint32_t samplerate);
 void dsp_set_xoverfreq(uint8_t, uint8_t, uint32_t);

@@ -48,9 +48,15 @@
 void timeravg(struct timeval *tavg,struct timeval *tdif) ;
 
 xTaskHandle t_http_get_task;
+xTaskHandle dsp_i2s_task;
 xQueueHandle prot_queue;
 xQueueHandle flow_queue;
 xQueueHandle i2s_queue;
+xQueueHandle snap_ctrl_queue;
+extern xQueueHandle audio_sample_queue;
+
+extern snap_ctrl_element_t snap_ctrl_element;
+
 uint32_t buffer_ms = 400;
 uint8_t muteCH[4] = {0};
 struct timeval tdif,tavg;
@@ -103,15 +109,17 @@ static void http_get_task(void *pvParameters) {
 
   OpusDecoder *decoder = NULL;
 
-  int16_t *audio =
-      (int16_t *)malloc(960 * 2 * sizeof(int16_t));  // 960*2: 20ms, 960*1: 10ms
+  int16_t *audio;
+  uint32_t buf_pkt_audio[4];
+      // (int16_t *)malloc(12 + (960 * 2 * sizeof(int16_t)));  // 960*2: 20ms, 960*1: 10ms
+  // uint8_t item_buf[8192];
 
   int16_t pcm_size = 120;
   uint16_t channels;
   uint32_t cnt = 0;
   int chunk_res;
   ESP_LOGI("I2S", "Call dsp setup" );
-  dsp_i2s_task_init(48000, false);
+  dsp_i2s_task = dsp_i2s_task_init(44100, false);
 
   while (1) {
     /* Wait for the callback to set the CONNECTED_BIT in the
@@ -350,6 +358,7 @@ static void http_get_task(void *pvParameters) {
           int frame_size = 0;
           switch (codec) {
             case OPUS:
+              audio = (int16_t *)heap_caps_malloc(960 * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM);  // 960*2: 20ms, 960*1: 10ms
               while ((frame_size = opus_decode(decoder, (unsigned char *)start,
                                                size, (opus_int16 *)audio,
                                                pcm_size / channels, 0)) ==
@@ -365,29 +374,14 @@ static void http_get_task(void *pvParameters) {
               if (frame_size < 0) {
                 ESP_LOGE(TAG, "Decode error : %d \n", frame_size);
               } else {
-                // pack(&timestampSize,wire_chunk_message.timestamp,frame_size*2*size(uint16_t))
-                memcpy(timestampSize, &wire_chunk_message.timestamp.sec,
-                       sizeof(wire_chunk_message.timestamp.sec));
-                memcpy(timestampSize + 4, &wire_chunk_message.timestamp.usec,
-                       sizeof(wire_chunk_message.timestamp.usec));
-                uint32_t chunk_size = frame_size * 2 * sizeof(uint16_t);
-                memcpy(timestampSize + 8, &chunk_size, sizeof(chunk_size));
+                audio_pkt_element_t audio_pkt;
 
-                // ESP_LOGI(TAG, "Network jitter %d %d",(uint32_t)
-                // wire_chunk_message.timestamp.usec/1000,
-                //                                          (uint32_t)
-                //                                          base_message.sent.usec/1000);
+                audio_pkt.timestamp_sec = wire_chunk_message.timestamp.sec;
+                audio_pkt.timestamp_usec = wire_chunk_message.timestamp.usec;
+                audio_pkt.samplebuf_sz = frame_size * 2 * sizeof(uint16_t);
+                audio_pkt.samplebuf = audio;
 
-                if ((chunk_res = write_ringbuf(timestampSize,
-                                               3 * sizeof(uint32_t))) != 12) {
-                  ESP_LOGI(TAG, "Error writing timestamp to ring buffer: %d",
-                           chunk_res);
-                }
-                if ((chunk_res = write_ringbuf((const uint8_t *)audio,
-                                               chunk_size)) != chunk_size) {
-                  ESP_LOGI(TAG, "Error writing data to ring buffer: %d",
-                           chunk_res);
-                }
+                xQueueSend(audio_sample_queue, &audio_pkt, 100);
               }
               break;
 
@@ -398,6 +392,8 @@ static void http_get_task(void *pvParameters) {
                      sizeof(wire_chunk_message.timestamp.usec));
               uint32_t chunk_size = size;
               memcpy(timestampSize + 8, &chunk_size, sizeof(chunk_size));
+
+              ESP_LOGI(TAG, "Writing chunk of size %d to pcm ringbuffer.", size+12);
 
               // ESP_LOGI(TAG, "Network jitter %d %d",(uint32_t)
               // wire_chunk_message.timestamp.usec/1000,
@@ -453,6 +449,12 @@ static void http_get_task(void *pvParameters) {
           // Volume setting using ADF HAL abstraction
           audio_hal_set_volume(board_handle->audio_hal,
                                server_settings_message.volume);
+          
+          snap_ctrl_element_t ctrl;
+          ctrl.type = 0;
+          ctrl.value = (int32_t) server_settings_message.volume;
+          xQueueSend(snap_ctrl_queue, &ctrl, 10);
+
           break;
 
         case SNAPCAST_MESSAGE_TIME:
@@ -588,7 +590,9 @@ void app_main(void) {
   //i2s_mclk_gpio_select(0, 0);
   //setup_ma120(); 
 
-  dsp_setup_flow(500, 48000);
+  snap_ctrl_queue = xQueueCreate(10, sizeof(snap_ctrl_element_t));
+
+  dsp_setup_flow(500, 44100);
 
   // Enable and setup WIFI in station mode  and connect to Access point setup in
   // menu config
@@ -607,7 +611,7 @@ void app_main(void) {
   xTaskCreate(&ota_server_task, "ota_server_task", 4096, NULL, 15, NULL);
 
   
-  xTaskCreatePinnedToCore(&http_get_task, "http_get_task", 3 * 4096, NULL, 5,
+  xTaskCreatePinnedToCore(&http_get_task, "http_get_task", 3 * 4096, NULL, 3,
                           &t_http_get_task, 1);
   while (1) {
     // audio_event_iface_msg_t msg;

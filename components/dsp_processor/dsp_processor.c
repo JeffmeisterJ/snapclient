@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/ringbuf.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 //#include "websocket_if.h"
 #include "driver/dac.h"
@@ -17,6 +18,7 @@
 #include "hal/i2s_hal.h"
 //#include "adc1_i2s_private.h"
 #include "board_pins_config.h"
+#include "soc/rtc.h"
 
 #ifdef CONFIG_USE_BIQUAD_ASM
 #define BIQUAD dsps_biquad_f32_ae32
@@ -24,18 +26,27 @@
 #define BIQUAD dsps_biquad_f32
 #endif
 
+// #define BUFFER_SIZE (2*((32*44100)/8) //2 channels *((32bits * 44100) samples divided by 8 bits)
+// #define BUFFER_SIZE 2*(192 * (3528 + 12)) //44.1khz
+// #define BUFFER_SIZE  192 * (3840 + 12)
+#define BUFFER_SIZE  384 * (1920 + 12)
+
 uint32_t bits_per_sample = CONFIG_BITS_PER_SAMPLE;
 
 static xTaskHandle s_dsp_i2s_task_handle = NULL;
-static RingbufHandle_t s_ringbuf_i2s = NULL;
+// static RingbufHandle_t audio_sample_queue = NULL;
 
 extern xQueueHandle i2s_queue;
 extern xQueueHandle flow_queue;
+extern xQueueHandle snap_ctrl_queue;
+xQueueHandle audio_sample_queue = NULL;
 
 extern struct timeval tdif;
 
 extern uint32_t buffer_ms;
 extern uint8_t muteCH[4];
+uint8_t volume;
+
 
 uint8_t dspFlow =
     dspfStereo; // dspfStereo; //dspfBassBoost; //dspfStereo;
@@ -94,8 +105,9 @@ static void dsp_i2s_task_handler(void *arg) {
   struct timeval now, tv1;
   uint32_t cnt = 0;
   uint8_t *audio = NULL;
+  uint8_t *ax = NULL;
   uint8_t *drainPtr = NULL;
-  uint8_t *timestampSize = NULL;
+  audio_pkt_element_t audio_pkt;
   float sbuffer0[1024];
   float sbuffer1[1024];
   float sbuffer2[1024];
@@ -128,6 +140,9 @@ static void dsp_i2s_task_handler(void *arg) {
   int flow_state = 0;
   int flow_drain_counter = 0;
   double dynamic_vol = 1.0;
+  snap_ctrl_element_t ctrl_element;
+
+
   for (;;) {
     // 23.12.2020 - JKJ : Buffer protocol major change
     //   - Audio data prefaced with timestamp and size tag server timesamp
@@ -180,46 +195,39 @@ static void dsp_i2s_task_handler(void *arg) {
       }
     }
 
-    timestampSize = (uint8_t *)xRingbufferReceiveUpTo(
-        s_ringbuf_i2s, &n_byte_read, (portTickType)40, 3 * 4);
-    if (timestampSize == NULL) {
+    if (xQueueReceive(snap_ctrl_queue, &ctrl_element, 0)) {
+      ESP_LOGI("I2S", "Snap control queue message: type: %d, value: %d ", ctrl_element.type, ctrl_element.value);
+      switch(ctrl_element.type) {
+        case VOLUME:
+          volume = (uint8_t) (ctrl_element.value&0xff);
+          break;
+        case LATENCY:
+          break;
+        case MUTE:
+          break;
+      }
+    };
+
+    BaseType_t resp = xQueueReceive(audio_sample_queue, &audio_pkt, 40);
+
+
+    if (!resp) {
       ESP_LOGI("I2S", "Wait: no data in buffer %d %d", cnt, n_byte_read);
       continue;
     }
 
-    if (n_byte_read != 12) {
-      ESP_LOGE("I2S", "error read from ringbuf %d ", n_byte_read);
-      // TODO find a decent stategy to fall back on our feet...
-    }
+    // ESP_LOGI("RBUF", "Got item from queue! sample_buf size: %d", audio_pkt.samplebuf_sz);
 
-    uint32_t ts_sec = *(timestampSize + 0) + (*(timestampSize + 1) << 8) +
-                      (*(timestampSize + 2) << 16) +
-                      (*(timestampSize + 3) << 24);
-
-    uint32_t ts_usec = *(timestampSize + 4) + (*(timestampSize + 5) << 8) +
-                       (*(timestampSize + 6) << 16) +
-                       (*(timestampSize + 7) << 24);
-
-    uint32_t ts_size = *(timestampSize + 8) + (*(timestampSize + 9) << 8) +
-                       (*(timestampSize + 10) << 16) +
-                       (*(timestampSize + 11) << 24);
-    // free the item (timestampSize) space in the ringbuffer
-    vRingbufferReturnItem(s_ringbuf_i2s, (void *)timestampSize);
-
-    // what's this for?
-    //while (tdif.tv_sec == 0) {
-    //  vTaskDelay(1);
-    //}
     gettimeofday(&now, NULL);
 
     timersub(&now, &tdif, &tv1);
     // ESP_LOGI("log", "diff :% 11ld.%03ld ", tdif.tv_sec ,
     // tdif.tv_usec/1000); ESP_LOGI("log", "head :% 11ld.%03ld ", tv1.tv_sec ,
-    // tv1.tv_usec/1000); ESP_LOGI("log", "tsamp :% 11d.%03d ", ts_sec ,
-    // ts_usec/1000);
+    // tv1.tv_usec/1000); ESP_LOGI("log", "tsamp :% 11d.%03d ", audio_pkt.timestamp_sec ,
+    // audio_pkt.timestamp_usec/1000);
 
-    ageusec = tv1.tv_usec - ts_usec;
-    agesec = tv1.tv_sec - ts_sec;
+    ageusec = tv1.tv_usec - audio_pkt.timestamp_usec;
+    agesec = tv1.tv_sec - audio_pkt.timestamp_sec;
     if (ageusec < 0) {
       ageusec += 1000000;
       agesec -= 1;
@@ -241,8 +249,8 @@ static void dsp_i2s_task_handler(void *arg) {
         vTaskDelay(2);
         gettimeofday(&now, NULL);
         timersub(&now, &tdif, &tv1);
-        ageusec = tv1.tv_usec - ts_usec;
-        agesec = tv1.tv_sec - ts_sec;
+        ageusec = tv1.tv_usec - audio_pkt.timestamp_usec;
+        agesec = tv1.tv_sec - audio_pkt.timestamp_sec;
         if (ageusec < 0) {
           ageusec += 1000000;
           agesec -= 1;
@@ -255,18 +263,27 @@ static void dsp_i2s_task_handler(void *arg) {
 
       playback_synced = 1;
     }
+    chunk_size = audio_pkt.samplebuf_sz;
+    audio = audio_pkt.samplebuf;
 
-    audio = (uint8_t *)xRingbufferReceiveUpTo(s_ringbuf_i2s, &chunk_size,
-                                              (portTickType)20, ts_size);
+    // audio = xRingbufferReceive(s_ringbuf_i2s, &chunk_size, 20);
+    // if (audio == NULL) { 
+      // ESP_LOGI("DSP", "Failed to receive audio chunk!");
+    // };
+    /* audio = (uint8_t *)xRingbufferReceiveUpTo(s_ringbuf_i2s, &chunk_size,
+    //                                         (portTickType)20, ts_size);
     if (chunk_size != ts_size) {
       uint32_t missing = ts_size - chunk_size; 
       ESP_LOGI("I2S", "Error readding audio from ring buf : read %d of %d , missing %d", chunk_size,ts_size, missing);
       vRingbufferReturnItem(s_ringbuf_i2s, (void *)audio);
-      uint8_t *ax = audio ; 
+      ax = (uint8_t *)(audio +chunk_size); 
       ax = (uint8_t *)xRingbufferReceiveUpTo(s_ringbuf_i2s, &chunk_size,
                                               (portTickType)20, missing);
+      vRingbufferReturnItem(s_ringbuf_i2s, (void *)ax);
       ESP_LOGI("I2S", "Read the next %d ", chunk_size );
     }
+    */
+    // vRingbufferReturnItem(s_ringbuf_i2s, (void *)audio);
     // printf("Read data   : %d \n",chunk_size );
 
     // vRingbufferGetInfo(s_ringbuf_i2s, &freeBuffer, &rbuf, &wbuf, NULL,
@@ -299,58 +316,69 @@ static void dsp_i2s_task_handler(void *arg) {
     // else if (inBuffer < (buffer_ms*48*4))
     //{ printf("Buffering ...  buffer : %d\n",inBuffer);
     //}
-    if ((flow_state >= 1) & (flow_drain_counter > 0)) {
-      flow_drain_counter--;
-      dynamic_vol = 1.0 / (20 - flow_drain_counter);
-      if (flow_drain_counter == 0) {
-        // Drain buffer
-        vRingbufferReturnItem(s_ringbuf_i2s, (void *)audio);
-        xRingbufferPrintInfo(s_ringbuf_i2s);
+    // if ((flow_state >= 1) & (flow_drain_counter > 0)) {
+    //   flow_drain_counter--;
+    //   dynamic_vol = 1.0 / (20 - flow_drain_counter);
+    //   if (flow_drain_counter == 0) {
+    //     // Drain buffer
+    //     vRingbufferReturnItem(audio_sample_queue, (void *)audio);
+    //     xRingbufferPrintInfo(audio_sample_queue);
 
-        uint32_t drainSize;
-        drainPtr = (uint8_t *)xRingbufferReceive(s_ringbuf_i2s, &drainSize,
-                                                 (portTickType)0);
-        ESP_LOGI("I2S", "Drained Ringbuffer (bytes):%d ", drainSize);
-        if (drainPtr != NULL) {
-          vRingbufferReturnItem(s_ringbuf_i2s, (void *)drainPtr);
-        }
-        xRingbufferPrintInfo(s_ringbuf_i2s);
-        playback_synced = 0;
-        dynamic_vol = 1.0;
+    //     uint32_t drainSize;
+    //     drainPtr = (uint8_t *)xRingbufferReceive(audio_sample_queue, &drainSize,
+    //                                              (portTickType)0);
+    //     ESP_LOGI("I2S", "Drained Ringbuffer (bytes):%d ", drainSize);
+    //     if (drainPtr != NULL) {
+    //       vRingbufferReturnItem(audio_sample_queue, (void *)drainPtr);
+    //     }
+    //     xRingbufferPrintInfo(audio_sample_queue);
+    //     playback_synced = 0;
+    //     dynamic_vol = 1.0;
 
-        continue;
-      }
-    }
+    //     continue;
+    //   }
+    // }
 
     {
-      int16_t len = chunk_size / 4;
+      int16_t len = chunk_size / 2;
       if (cnt % 100 == 2) {
-        ESP_LOGI("I2S", "Chunk :%d %d ms", chunk_size, age);
+        ESP_LOGI("I2S", "Chunk: %d, Age: %d ms, Buffer: %d", chunk_size, age, buffer_ms);
         // xRingbufferPrintInfo(s_ringbuf_i2s);
+        uint32_t bytes_in_ringbuffer;
+        // vRingbufferGetInfo(s_ringbuf_i2s, NULL, NULL, NULL, NULL, &bytes_in_ringbuffer);
+        // int buffer_full_pct = (200*bytes_in_ringbuffer+1)/(BUFFER_SIZE*2); //*100;
+        // ESP_LOGI("RINGBUFFER", "Percent full: %d (%d kb/%d kb)", buffer_full_pct, (bytes_in_ringbuffer/1024), (BUFFER_SIZE/1024));
       }
 
-      for (uint16_t i = 0; i < len; i++) {
-        sbuffer0[i] =
-            dynamic_vol * 0.5 *
-            ((float)((int16_t)(audio[i * 4 + 1] << 8) + audio[i * 4 + 0])) /
-            32768;
-        sbuffer1[i] =
-            dynamic_vol * 0.5 *
-            ((float)((int16_t)(audio[i * 4 + 3] << 8) + audio[i * 4 + 2])) /
-            32768;
-        sbuffer2[i] = ((sbuffer0[i] / 2) + (sbuffer1[i] / 2));
-      }
+      // for (uint16_t i = 0; i < len; i++) {
+      //   sbuffer0[i] =
+      //       dynamic_vol * 0.5 *
+      //       ((float)((int16_t)(audio[i * 4 + 1] << 8) + audio[i * 4 + 0])) /
+      //       32768;
+      //   sbuffer1[i] =
+      //       dynamic_vol * 0.5 *
+      //       ((float)((int16_t)(audio[i * 4 + 3] << 8) + audio[i * 4 + 2])) /
+      //       32768;
+      //   sbuffer2[i] = ((sbuffer0[i] / 2) + (sbuffer1[i] / 2));
+      // }
+
       switch (dspFlow) {
-        case dspfStereo: {  // if (cnt%120==0)
-          //{ ESP_LOGI("I2S", "In dspf Stero :%d",chunk_size);
+        case dspfStereo: {   if (cnt%120==0)
+          { 
+            // ESP_LOGI("I2S", "In dspf Stero :%d",chunk_size);
+            ESP_LOGI("I2S", "First samplepoint: %d, volume: %d, after volume calc: %d", audio_pkt.samplebuf[0], volume, (audio_pkt.samplebuf[0]/100) * volume);
+          } 
           // ws_server_send_bin_client(0,(char*)audio, 240);
           // printf("%d %d \n",byteWritten, i2s_evt.size );
           //}
-          for (uint16_t i = 0; i < len; i++) {
-            audio[i * 4 + 0] = (muteCH[0] == 1) ? 0 : audio[i * 4 + 0];
-            audio[i * 4 + 1] = (muteCH[0] == 1) ? 0 : audio[i * 4 + 1];
-            audio[i * 4 + 2] = (muteCH[1] == 1) ? 0 : audio[i * 4 + 2];
-            audio[i * 4 + 3] = (muteCH[1] == 1) ? 0 : audio[i * 4 + 3];
+
+          //TODO use volume to calculate sample amplitude
+
+
+
+          for (uint16_t i = 0; i < audio_pkt.samplebuf_sz/2; i+=2) {
+            audio_pkt.samplebuf[i + 0] = (muteCH[0] == 1) ? 0 : audio_pkt.samplebuf[i + 0]; //((audio_pkt.samplebuf[i * 4 + 0]/100)*volume);
+            audio_pkt.samplebuf[i + 1] = (muteCH[1] == 1) ? 0 : audio_pkt.samplebuf[i + 1]; //((audio_pkt.samplebuf[i * 4 + 1]/100)*volume);
           }
           if (bits_per_sample == 16) {
             i2s_write(0, (char *)audio, chunk_size, &bytes_written,
@@ -499,38 +527,31 @@ static void dsp_i2s_task_handler(void *arg) {
       //{ //ws_server_send_bin_client(0,(char*)audio, 240);
       // printf("%d %d \n",byteWritten, i2s_evt.size );
       //}
-
-      vRingbufferReturnItem(s_ringbuf_i2s, (void *)audio);
+      // if (audio != NULL) vRingbufferReturnItem(s_ringbuf_i2s, (void *)audio);
+      free(audio_pkt.samplebuf);
+      chunk_size = 0;
+      // ts_size = 0;
     }
   }
 }
 // buffer size must hold 400ms-1000ms  // for 2ch16b48000 that is 76800 -
 // 192000 or 75-188 x 1024
 
-#define BUFFER_SIZE 192 * (3840 + 12)
+// #define BUFFER_SIZE 192 * (3840 + 12)
  
 //#define BUFFER_SIZE 192 * (3528 + 12)    // 44100/16/2
 //(3840 + 12)  PCM 48000/16/2 
 
 // 3852 3528
 
-void dsp_i2s_task_init(uint32_t sample_rate, bool slave) {
+xTaskHandle dsp_i2s_task_init(uint32_t sample_rate, bool slave) {
   setup_dsp_i2s(sample_rate, slave);
   ESP_LOGI("I2S","Setup i2s dma and interface");
 #ifdef CONFIG_USE_PSRAM
-  printf("Setup ringbuffer using PSRAM \n");
-  StaticRingbuffer_t *buffer_struct = (StaticRingbuffer_t *)heap_caps_malloc(
-      sizeof(StaticRingbuffer_t), MALLOC_CAP_SPIRAM);
-  printf("Buffer_struct ok\n");
+  //TODO Change PSRAM switch to allocation of audio sample buffers
 
+  audio_sample_queue = xQueueCreate(120, sizeof(audio_pkt_element_t));
 
-  uint8_t *buffer_storage = (uint8_t *)heap_caps_malloc(
-      sizeof(uint8_t) * BUFFER_SIZE, MALLOC_CAP_SPIRAM);
-  printf("Buffer_stoarge ok\n");
-  s_ringbuf_i2s = xRingbufferCreateStatic(BUFFER_SIZE, RINGBUF_TYPE_BYTEBUF,
-                                          buffer_storage, buffer_struct);
-  //s_ringbuf_i2s = xRingbufferCreateStatic(BUFFER_SIZE, RINGBUF_TYPE_BYTEBUF,
-  //                                        buffer_storage, buffer_struct);
   printf("Ringbuf ok\n");
 #else
   printf(
@@ -538,13 +559,15 @@ void dsp_i2s_task_init(uint32_t sample_rate, bool slave) {
       "buffer_ms parameter ignored \n");
   s_ringbuf_i2s = xRingbufferCreate(32 * 1024, RINGBUF_TYPE_BYTEBUF);
 #endif
-  if (s_ringbuf_i2s == NULL) {
+  if (audio_sample_queue == NULL) {
     printf("nospace for ringbuffer\n");
     return;
   }
   printf("Ringbuffer ok\n");
-  xTaskCreatePinnedToCore(dsp_i2s_task_handler, "DSP_I2S", 48 * 1024, NULL, 5,
+  xTaskCreatePinnedToCore(dsp_i2s_task_handler, "DSP_I2S", 48 * 1024, NULL, 2,
                           &s_dsp_i2s_task_handle, 0);
+
+  return s_dsp_i2s_task_handle;
   
 }
 
@@ -553,15 +576,16 @@ void dsp_i2s_task_deinit(void) {
     vTaskDelete(s_dsp_i2s_task_handle);
     s_dsp_i2s_task_handle = NULL;
   }
-  if (s_ringbuf_i2s) {
-    vRingbufferDelete(s_ringbuf_i2s);
-    s_ringbuf_i2s = NULL;
+  if (audio_sample_queue) {
+    vRingbufferDelete(audio_sample_queue);
+    audio_sample_queue = NULL;
   }
 }
 
 size_t write_ringbuf(const uint8_t *data, size_t size) {
-  BaseType_t done = xRingbufferSend(s_ringbuf_i2s, (void *)data, size,
-                                    (portTickType)portMAX_DELAY);
+  // BaseType_t done = xRingbufferSend(s_ringbuf_i2s, (void *)data, size,
+                                    // (portTickType)portMAX_DELAY);
+  BaseType_t done = xQueueSend(audio_sample_queue, data, 40);
   return (done) ? size : 0;
 }
 
