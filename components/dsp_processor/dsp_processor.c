@@ -132,6 +132,7 @@ static void dsp_i2s_task_handler(void *arg) {
   // uint32_t avgarray[128] = {0};
   // uint32_t sum;
   // float avg = 0.0;
+  uint32_t clk_adj = 210;
   int32_t age = 0;
   int32_t agesec;
   int32_t ageusec;
@@ -142,6 +143,7 @@ static void dsp_i2s_task_handler(void *arg) {
   double dynamic_vol = 1.0;
   snap_ctrl_element_t ctrl_element;
 
+  rtc_clk_apll_enable(1, 0, clk_adj, 5, 6);
 
   for (;;) {
     // 23.12.2020 - JKJ : Buffer protocol major change
@@ -234,14 +236,26 @@ static void dsp_i2s_task_handler(void *arg) {
     }
     age = agesec * 1000 + ageusec / 1000;
     if ( age < 0 ) { age = 0;  }
-  
+
+    // rtc_clk_apll_enable(1, 0, 250, 5, 6);
+
     if (playback_synced == 1) {
-      if (age < buffer_ms) {  // Too slow speedup playback
-        // rtc_clk_apll_enable(1, sdm0, sdm1, sdm2, odir);
-        // rtc_clk_apll_enable(1, 149, 212, 5, 2);
-      }  // ESP_LOGI("i2s", "%d %d", buffer_ms, age );
-      else {
-        // rtc_clk_apll_enable(1, 149, 212, 5, 2);
+      if (cnt % 100 == 2) {
+        if (age > (buffer_ms-100)) {  // Too slow speedup playback
+          // rtc_clk_apll_enable(1, sdm0, sdm1, sdm2, odir);
+          if (clk_adj != 220) {
+            clk_adj+=1;
+            ESP_LOGI("APLL", "Adjusting clock faster: %d", clk_adj);
+            rtc_clk_apll_enable(1, 0, clk_adj, 5, 6);
+          }
+        }  // ESP_LOGI("i2s", "%d %d", buffer_ms, age );
+        else if (age < 100){
+          if (clk_adj != 200) {
+            clk_adj-=1;
+            ESP_LOGI("APLL", "Adjusting clock slower: %d", clk_adj);
+            rtc_clk_apll_enable(1, 0, clk_adj, 5, 6);
+          }
+        }
       }
       // ESP_LOGI("i2s", "%d %d %1.2f ", buffer_ms, age, dynamic_vol );
     } else {
@@ -342,7 +356,7 @@ static void dsp_i2s_task_handler(void *arg) {
     {
       int16_t len = chunk_size / 2;
       if (cnt % 100 == 2) {
-        ESP_LOGI("I2S", "Chunk: %d, Age: %d ms, Buffer: %d", chunk_size, age, buffer_ms);
+        ESP_LOGI("I2S", "Chunk: %d, Age: %d ms, Buffer: %d ms", chunk_size, age, ((uxQueueMessagesWaiting(audio_sample_queue) *(1920/2/2))*1000)/44100);
         // xRingbufferPrintInfo(s_ringbuf_i2s);
         uint32_t bytes_in_ringbuffer;
         // vRingbufferGetInfo(s_ringbuf_i2s, NULL, NULL, NULL, NULL, &bytes_in_ringbuffer);
@@ -366,7 +380,7 @@ static void dsp_i2s_task_handler(void *arg) {
         case dspfStereo: {   if (cnt%120==0)
           { 
             // ESP_LOGI("I2S", "In dspf Stero :%d",chunk_size);
-            ESP_LOGI("I2S", "First samplepoint: %d, volume: %d, after volume calc: %d", audio_pkt.samplebuf[0], volume, (audio_pkt.samplebuf[0]/100) * volume);
+            // ESP_LOGI("I2S", "First samplepoint: %d, volume: %d, after volume calc: %d", audio_pkt.samplebuf[0], volume, (audio_pkt.samplebuf[0]/100) * volume);
           } 
           // ws_server_send_bin_client(0,(char*)audio, 240);
           // printf("%d %d \n",byteWritten, i2s_evt.size );
@@ -550,7 +564,7 @@ xTaskHandle dsp_i2s_task_init(uint32_t sample_rate, bool slave) {
 #ifdef CONFIG_USE_PSRAM
   //TODO Change PSRAM switch to allocation of audio sample buffers
 
-  audio_sample_queue = xQueueCreate(120, sizeof(audio_pkt_element_t));
+  audio_sample_queue = xQueueCreate(100, sizeof(audio_pkt_element_t));
 
   printf("Ringbuf ok\n");
 #else

@@ -381,7 +381,13 @@ static void http_get_task(void *pvParameters) {
                 audio_pkt.samplebuf_sz = frame_size * 2 * sizeof(uint16_t);
                 audio_pkt.samplebuf = audio;
 
-                xQueueSend(audio_sample_queue, &audio_pkt, 100);
+                // ESP_LOGI("OPUS", "tstamp: %d.%d", audio_pkt.timestamp_sec, audio_pkt.timestamp_usec);
+
+                BaseType_t check = xQueueSend(audio_sample_queue, &audio_pkt, 100);
+
+                if (!check) {
+                  ESP_LOGE("OPUS", "Pushing decoded audio to queue failed!");
+                }
               }
               break;
 
